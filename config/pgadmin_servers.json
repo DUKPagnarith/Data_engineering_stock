@@ -1,0 +1,13 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "Stock Postgres",
+      "Group": "Docker",
+      "Host": "stock_postgres",
+      "Port": 5432,
+      "MaintenanceDB": "stock_db",
+      "Username": "stock_user",
+      "SSLMode": "prefer"
+    }
+  }
+}

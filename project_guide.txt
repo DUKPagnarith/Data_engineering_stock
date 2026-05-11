@@ -1,0 +1,165 @@
+You are a senior data engineer and ML engineer. Help me design and build a complete end-to-end stock price prediction system following this exact pipeline architecture. Work through each stage one at a time, pause for my confirmation before moving to the next stage, and provide full working code with clear comments at every step.
+
+The system should be modular, production-aware, and follow data engineering best practices throughout.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 1 — DATA SOURCE (Real-time APIs)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1.1 Recommend and compare the best free real-time or near-real-time stock market APIs:
+    - Yahoo Finance (yfinance) — websocket or polling
+    - Alpha Vantage — free tier limits
+    - Polygon.io — free tier websocket feed
+    - Finnhub — real-time trades websocket
+    - EODHD or Twelve Data — as alternatives
+    Compare: latency, free-tier rate limits, available fields (OHLCV, order book, news), auth method, and Python SDK availability.
+
+1.2 Choose one primary API (recommend Polygon.io or Finnhub for real-time) and:
+    - Write a Python producer script that connects to the websocket feed
+    - Subscribe to real-time trade/quote events for a configurable ticker (default: AAPL)
+    - Output each event as a structured JSON message: { ticker, timestamp, open, high, low, close, volume, vwap }
+    - Handle reconnection logic and rate-limit errors gracefully
+    ✦ Also write a fallback batch ingestion script (using yfinance) for historical backfill
+
+1.3 Document the schema of the raw incoming data clearly.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 2 — ETL PIPELINE (Streaming + Batch)
+Tools: Apache Kafka + PySpark
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2.1 Kafka Setup
+    - Provide a docker-compose.yml that spins up: Zookeeper, Kafka broker, and Schema Registry
+    - Create a Kafka topic: stock-prices-raw with 3 partitions and replication factor 1
+    - Write a Kafka Producer (Python) that reads from the Stage 1 API and publishes JSON messages to the topic
+    - Write a Kafka Consumer (Python) to verify messages are arriving correctly
+    ✦ Add a dead-letter topic (stock-prices-dlq) for malformed or late-arriving messages
+
+2.2 PySpark Streaming (real-time path)
+    - Write a PySpark Structured Streaming job that:
+      · Reads from the Kafka topic stock-prices-raw
+      · Parses and validates each JSON message against the schema
+      · Applies a 1-minute tumbling window to aggregate: OHLCV per window
+      · Writes the result to the Bronze layer (see Stage 3)
+    - Use checkpointing for fault tolerance
+    - Handle watermarking for late data (5-minute threshold)
+
+2.3 PySpark Batch (historical path)
+    - Write a PySpark batch job that:
+      · Reads historical CSV/parquet from the backfill script (Stage 1.2)
+      · Applies the same schema validation and aggregation logic as the streaming job
+      · Writes to the same Bronze layer using the same format
+    ✦ Tip: use a unified transform function shared by both streaming and batch jobs (Lambda architecture pattern)
+
+2.4 Explain the difference between streaming and batch processing here and when each is used in this system.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 3 — DATA WAREHOUSE (Medallion Architecture)
+Bronze → Silver → Gold
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1 Bronze Layer — Staging (raw, append-only)
+    - Store raw ingested data exactly as received, with no transformations
+    - Add metadata columns: ingested_at, source_api, batch_id
+    - Format: Delta Lake or Parquet, partitioned by date and ticker
+    - This layer is the immutable source of truth for reprocessing
+
+3.2 Silver Layer — Cleaned & Enriched
+    - Read from Bronze and apply:
+      · Null handling and outlier detection (e.g. price spikes > 3σ flagged)
+      · Deduplication by (ticker, timestamp)
+      · Type casting and schema enforcement
+      · Feature engineering: SMA_7, SMA_30, EMA_12, EMA_26, RSI_14, MACD,
+        Bollinger Bands, daily return %, rolling 7-day volatility, volume z-score
+    - Write PySpark code for all transformations
+    - Format: Delta Lake or Parquet, partitioned by date and ticker
+    ✦ Add a data quality check step with pass/fail rules and a quality report output
+
+3.3 Gold Layer — Analytics-Ready (Star Schema)
+    - Design a Star Schema with:
+      · Fact table: fact_stock_prices
+        (ticker_id, date_id, open, high, low, close, volume, vwap, all engineered features, target_next_close)
+      · Dimension tables:
+        dim_ticker (ticker_id, symbol, company_name, sector, exchange)
+        dim_date (date_id, date, day_of_week, week, month, quarter, year, is_trading_day)
+        ✦ dim_market_session (session_id, session_type: pre/regular/after, open_time, close_time)
+    - Write PySpark code to build and populate all tables
+    - Show the ERD (entity relationship diagram) as ASCII art or describe it clearly
+    - Explain why Star Schema is preferred over 3NF for analytical workloads
+
+3.4 Explain the purpose of each medallion layer and why the separation matters.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 4 — TRAINING + VISUALIZATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+4.1 Data Preparation
+    - Read from the Gold layer fact table
+    - Apply a strict time-based train/validation/test split (no data leakage):
+      Train: earliest 70%, Validation: next 15%, Test: final 15%
+    - Scale features using StandardScaler or MinMaxScaler (fit on train only)
+
+4.2 Train at least 3 models with increasing complexity:
+    - Baseline: ARIMA or SARIMA (classical, interpretable)
+    - Intermediate: LightGBM or XGBoost using all engineered features
+    - Advanced: LSTM (Keras or PyTorch) with sequence length = 30 days
+    For each model: show training code, hyperparameters, and a brief rationale.
+    ✦ Use MLflow to log experiments: parameters, metrics, and model artifacts
+
+4.3 Evaluation metrics for all models:
+    - MAE, RMSE, MAPE (regression accuracy)
+    - Directional Accuracy (% of up/down moves correctly predicted)
+    - ✦ Sharpe Ratio of a simple long/short backtest strategy using predictions
+    - Final comparison table: model × metric
+
+4.4 Visualizations (produce all plots with matplotlib or plotly):
+    - Actual vs predicted price on test set (all models overlaid)
+    - Feature importance chart (for LightGBM/XGBoost)
+    - LSTM training/validation loss curve
+    - Residual error distribution
+    - ✦ Candlestick chart of the test period with model predictions overlaid
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STAGE 5 — APP / SYSTEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+5.1 REST API (FastAPI)
+    - Build a FastAPI service with endpoints:
+      · GET /predict?ticker=AAPL — returns next-day price prediction from the best model
+      · GET /history?ticker=AAPL&days=30 — returns recent OHLCV from Gold layer
+      · GET /health — service health check
+    - Load the trained model from MLflow model registry on startup
+    - Add input validation with Pydantic models
+    ✦ Add a /retrain endpoint that triggers a new training run (async background task)
+
+5.2 Dashboard (Streamlit)
+    - Build a Streamlit app that shows:
+      · Live price feed (polling the API every 30 seconds)
+      · Candlestick chart of recent prices with prediction overlaid
+      · Model performance metrics panel
+      · Ticker selector dropdown (allow switching between stocks)
+    ✦ As an alternative, describe how Grafana + InfluxDB could replace Streamlit for a production monitoring dashboard
+
+5.3 System Architecture Summary
+    - Draw a complete system architecture diagram (ASCII or described clearly) showing:
+      API Source → Kafka → PySpark (Streaming + Batch) → Bronze → Silver → Gold → Model Training → FastAPI → Streamlit Dashboard
+    - Describe how each component connects and what protocol/format is used between them
+    ✦ Identify the single points of failure and suggest how to make each resilient
+
+5.4 Deployment notes (brief):
+    - Which components run on Docker / docker-compose
+    - Which components could move to cloud (e.g. Confluent Cloud for Kafka, Databricks for PySpark, S3 for warehouse)
+    - How to schedule batch jobs (Apache Airflow overview, 2-3 sentences)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GLOBAL CONSTRAINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Language: Python 3.10+
+- Core stack: PySpark 3.x, Kafka (confluent-kafka or kafka-python), Delta Lake, FastAPI, Streamlit, MLflow, LightGBM, Keras/PyTorch
+- All infrastructure via docker-compose (no paid cloud required)
+- Default ticker: AAPL — parameterise everywhere so it's easy to swap
+- Every code block must be self-contained and runnable
+- Add a requirements.txt at the end covering all dependencies
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Begin with Stage 1. Confirm my understanding of the data source before writing any code, then proceed step by step.

@@ -1,0 +1,421 @@
+You are a senior data engineer. I have a working stock prediction pipeline. Here is the full existing stack:
+
+EXISTING STACK:
+- docker-compose.yml — Kafka, Zookeeper, Schema Registry (all on a shared Docker network)
+- PySpark Structured Streaming (spark_streaming.py):
+    · Reads from Kafka topic stock-prices-raw
+    · Aggregates ticks → 1-min OHLCV windows
+    · Currently writes ONLY to data/bronze/ (Parquet)
+- PySpark Batch (spark_batch.py) — historical backfill → data/bronze/
+- Bronze → Silver → Gold medallion pipeline (Parquet files)
+- Gold layer Star Schema in data/gold/:
+    · fact_stock_prices (501 rows: OHLCV + 14 features + target_next_close)
+    · dim_ticker, dim_date (730 rows), dim_market_session
+- FastAPI (src/app/api.py) at :8000 — reads Gold Parquet directly
+- Streamlit dashboard (src/app/dashboard.py) at :8501
+- config/settings.py — centralised config (reads from .env)
+- transforms.py — shared validation/aggregation used by both streaming and batch
+
+I want to extend this stack by adding four things in one go:
+  1. PostgreSQL — persistent database for all stock data
+  2. pgAdmin — GUI browser for PostgreSQL
+  3. PySpark real-time write — streaming job writes live 1-min bars directly into PostgreSQL
+  4. Metabase — connects to PostgreSQL for visual dashboards
+
+Work step by step. Pause after each step for my confirmation before continuing.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Update docker-compose.yml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Add four new services to the EXISTING docker-compose.yml.
+Do NOT modify or remove Kafka, Zookeeper, or Schema Registry.
+
+1.1 PostgreSQL service:
+    - Image: postgres:15
+    - Container name: stock_postgres
+    - Port: 5432:5432
+    - Environment: POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD (from .env)
+    - Volume: mount ./config/init.sql → /docker-entrypoint-initdb.d/init.sql
+      (runs automatically on first start, creates all tables)
+    - Volume: named volume postgres_data (data survives docker-compose down)
+    - Health check: pg_isready — other services wait until Postgres is fully ready
+    - Network: same shared network as Kafka
+
+1.2 pgAdmin service:
+    - Image: dpage/pgadmin4:latest
+    - Container name: stock_pgadmin
+    - Port: 5050:80
+    - Environment: PGADMIN_DEFAULT_EMAIL, PGADMIN_DEFAULT_PASSWORD (from .env)
+    - Volume: mount ./config/pgadmin_servers.json →
+      /pgadmin4/servers.json (pre-registers stock_postgres, no manual setup needed)
+    - Volume: named volume pgadmin_data (saved state survives restarts)
+    - depends_on: stock_postgres (health check condition)
+    - Restart policy: unless-stopped
+
+1.3 Metabase service:
+    - Image: metabase/metabase:latest
+    - Container name: stock_metabase
+    - Port: 3000:3000
+    - Environment: MB_DB_TYPE=postgres, point Metabase's internal DB
+      to stock_postgres using database name "metabase"
+      (keeps Metabase internals separate from our stock data)
+    - depends_on: stock_postgres (health check condition)
+    - Network: same shared network
+
+1.4 Add all new credentials to .env.example:
+    POSTGRES_DB=stock_db
+    POSTGRES_USER=stock_user
+    POSTGRES_PASSWORD=stock_password
+    POSTGRES_HOST=stock_postgres
+    POSTGRES_PORT=5432
+    PGADMIN_EMAIL=admin@stock.local
+    PGADMIN_PASSWORD=admin123
+
+Final service list after this step:
+    stock_zookeeper       :2181
+    stock_kafka           :9092
+    stock_schema_registry :8081
+    stock_postgres        :5432   ← NEW
+    stock_pgadmin         :5050   ← NEW
+    stock_metabase        :3000   ← NEW
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 2 — Create config/init.sql and config/pgadmin_servers.json
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2.1 config/init.sql — runs on first Postgres startup, creates everything:
+
+    A) Create two databases:
+       - stock_db    → our data (Gold layer + streaming tables)
+       - metabase    → Metabase's internal storage
+
+    B) Inside stock_db, create the Star Schema tables:
+
+       dim_ticker:
+           ticker_id SERIAL PRIMARY KEY,
+           symbol VARCHAR(10) UNIQUE NOT NULL,
+           company_name VARCHAR(100),
+           sector VARCHAR(50),
+           exchange VARCHAR(20)
+
+       dim_date:
+           date_id SERIAL PRIMARY KEY,
+           date DATE UNIQUE NOT NULL,
+           day_of_week INTEGER, day_name VARCHAR(10),
+           week INTEGER, month INTEGER, month_name VARCHAR(10),
+           quarter INTEGER, year INTEGER, is_trading_day BOOLEAN
+
+       dim_market_session:
+           session_id SERIAL PRIMARY KEY,
+           session_type VARCHAR(20),
+           open_time TIME, close_time TIME,
+           description VARCHAR(100)
+
+       fact_stock_prices:
+           id SERIAL PRIMARY KEY,
+           ticker_id INTEGER REFERENCES dim_ticker(ticker_id),
+           date_id INTEGER REFERENCES dim_date(date_id),
+           open, high, low, close DOUBLE PRECISION,
+           volume BIGINT, vwap DOUBLE PRECISION,
+           daily_return_pct, sma_7, sma_30, ema_12, ema_26,
+           macd, macd_signal, macd_histogram, rsi_14,
+           bb_upper, bb_middle, bb_lower,
+           volatility_7d, volume_zscore DOUBLE PRECISION,
+           is_outlier BOOLEAN,
+           target_next_close DOUBLE PRECISION,
+           ingested_at TIMESTAMP DEFAULT NOW(),
+           UNIQUE(ticker_id, date_id)
+
+       stock_prices_stream:         ← real-time 1-min bars from PySpark streaming
+           id SERIAL PRIMARY KEY,
+           ticker VARCHAR(10) NOT NULL,
+           window_start TIMESTAMP NOT NULL,
+           window_end TIMESTAMP,
+           open, high, low, close DOUBLE PRECISION,
+           volume BIGINT, vwap DOUBLE PRECISION,
+           trade_count INTEGER,
+           ingested_at TIMESTAMP DEFAULT NOW(),
+           source_api VARCHAR(20),
+           UNIQUE(ticker, window_start)
+
+       predictions:                 ← logged by FastAPI on every /predict call
+           id SERIAL PRIMARY KEY,
+           ticker VARCHAR(10),
+           predicted_at TIMESTAMP DEFAULT NOW(),
+           predicted_close DOUBLE PRECISION,
+           predicted_direction VARCHAR(10),
+           model_used VARCHAR(50),
+           actual_close DOUBLE PRECISION
+
+    C) Add performance indexes:
+       - fact_stock_prices(ticker_id, date_id)
+       - dim_date(date)
+       - stock_prices_stream(ticker, window_start)
+       - predictions(ticker, predicted_at)
+
+2.2 config/pgadmin_servers.json — pre-registers stock_postgres in pgAdmin UI:
+    {
+      "Servers": {
+        "1": {
+          "Name": "Stock Postgres",
+          "Group": "Docker",
+          "Host": "stock_postgres",
+          "Port": 5432,
+          "MaintenanceDB": "stock_db",
+          "Username": "",
+          "SSLMode": "prefer"
+        }
+      }
+    }
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 3 — Write src/utils/db_writer.py (shared DB utility)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write a reusable utility used by BOTH the batch loader and the streaming job:
+
+3.1 Function: get_engine()
+    - Returns a SQLAlchemy engine with pool_size=5, max_overflow=10
+    - Reads credentials from environment variables via config/settings.py
+    - Called once at startup — not on every write
+
+3.2 Function: write_df_to_postgres(pandas_df, table_name, conflict_columns)
+    - Accepts a pandas DataFrame (converted from Spark inside foreachBatch)
+    - Bulk inserts using psycopg2 execute_values (fast, not row-by-row)
+    - Uses INSERT ... ON CONFLICT (conflict_columns) DO UPDATE — idempotent
+    - Retries 3 times with exponential backoff if connection fails
+    - Logs: "✓ Wrote N rows to " per call
+    - Raises after 3 failures (caller decides whether to swallow or re-raise)
+
+3.3 Add to requirements.txt: psycopg2-binary, SQLAlchemy>=2.0
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 4 — Write src/warehouse/gold_to_postgres.py (batch loader)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reads Gold Parquet files → inserts into PostgreSQL Star Schema tables.
+
+4.1 Load order (respect foreign keys):
+    dim_ticker → dim_date → dim_market_session → fact_stock_prices
+
+4.2 For each table:
+    - Read the corresponding Parquet from data/gold/
+    - Align column names to match the SQL schema
+    - Call write_df_to_postgres() from db_writer.py
+
+4.3 Print a completion summary:
+    ✓ dim_ticker:         1 rows loaded
+    ✓ dim_date:         730 rows loaded
+    ✓ dim_market_session: 3 rows loaded
+    ✓ fact_stock_prices: 501 rows loaded
+
+4.4 CLI flag: python -m src.warehouse.gold_to_postgres --ticker AAPL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 5 — Update spark_streaming.py (dual-sink streaming)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Update the existing streaming job to write to TWO sinks simultaneously.
+
+5.1 Sink 1 — keep existing (do not change):
+    Parquet → data/bronze/stock_prices/
+    partitionBy(date, ticker), checkpointing intact
+
+5.2 Sink 2 — NEW: PostgreSQL via foreachBatch
+    After the 1-minute tumbling window aggregation, add a second writeStream:
+    - Mode: foreachBatch
+    - For each micro-batch DataFrame:
+        · Convert Spark DF → pandas
+        · Call write_df_to_postgres(pandas_df, "stock_prices_stream",
+            conflict_columns=["ticker", "window_start"])
+    - Wrap entire DB write in try/except:
+        · If Postgres is down → log a WARNING and return (do not raise)
+        · Bronze Parquet sink must NEVER fail because of a DB issue
+    - Separate checkpoint location for this sink:
+        data/checkpoints/streaming_postgres/
+
+5.3 Both sinks run in parallel using separate streaming queries.
+    Show how to start and await both with awaitAnyTermination().
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 6 — Update src/app/api.py
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6.1 On startup: create SQLAlchemy engine via db_writer.get_engine()
+
+6.2 GET /history?ticker=AAPL&days=30
+    → now reads from PostgreSQL fact_stock_prices (joined with dim_date + dim_ticker)
+      instead of reading Parquet directly. Returns same JSON shape as before.
+
+6.3 GET /predict?ticker=AAPL
+    → after computing prediction, INSERT one row into predictions table:
+      (ticker, predicted_close, predicted_direction, model_used)
+      Use write_df_to_postgres or a direct psycopg2 insert — your choice.
+
+6.4 All other endpoints (/health, /retrain) remain unchanged.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 7 — pgAdmin verification guide
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Write step-by-step instructions:
+
+7.1 First login:
+    - Open http://localhost:5050
+    - Login: PGADMIN_EMAIL + PGADMIN_PASSWORD from .env
+    - "Stock Postgres" should already appear in the left sidebar (from servers.json)
+    - Enter POSTGRES_PASSWORD when prompted
+
+7.2 Verify tables exist:
+    stock_db → Schemas → public → Tables →
+    confirm: fact_stock_prices, dim_ticker, dim_date,
+             dim_market_session, stock_prices_stream, predictions
+
+7.3 Quick health-check query (paste into Query Tool):
+    SELECT
+        'fact_stock_prices' AS tbl, COUNT(*) AS rows FROM fact_stock_prices
+    UNION ALL
+    SELECT 'dim_date', COUNT(*) FROM dim_date
+    UNION ALL
+    SELECT 'stock_prices_stream', COUNT(*) FROM stock_prices_stream
+    UNION ALL
+    SELECT 'predictions', COUNT(*) FROM predictions;
+
+7.4 Live stream monitor query (run while spark_streaming.py is active):
+    SELECT ticker, window_start, close, volume
+    FROM stock_prices_stream
+    ORDER BY window_start DESC
+    LIMIT 10;
+    (Hit F5 every minute to see new rows arriving)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 8 — Metabase setup + 7 starter dashboards
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+8.1 First-time Metabase connection:
+    - Open http://localhost:3000
+    - Complete setup wizard
+    - Add database: Host=stock_postgres, Port=5432, DB=stock_db,
+      User/Password from .env
+    - Verify all 6 tables are visible
+
+8.2 Write full SQL + chart config for 7 starter questions:
+
+    Q1 — Daily closing price + SMA overlays (Line chart):
+    SELECT d.date, f.close, f.sma_7, f.sma_30
+    FROM fact_stock_prices f
+    JOIN dim_date d ON f.date_id = d.date_id
+    JOIN dim_ticker t ON f.ticker_id = t.ticker_id
+    WHERE t.symbol = 'AAPL' ORDER BY d.date;
+
+    Q2 — Daily volume bar chart (Bar chart):
+    SELECT d.date, f.volume
+    FROM fact_stock_prices f
+    JOIN dim_date d ON f.date_id = d.date_id
+    JOIN dim_ticker t ON f.ticker_id = t.ticker_id
+    WHERE t.symbol = 'AAPL' ORDER BY d.date;
+
+    Q3 — RSI over time with overbought/oversold zones (Line chart):
+    SELECT d.date, f.rsi_14,
+           70 AS overbought, 30 AS oversold
+    FROM fact_stock_prices f
+    JOIN dim_date d ON f.date_id = d.date_id
+    JOIN dim_ticker t ON f.ticker_id = t.ticker_id
+    WHERE t.symbol = 'AAPL' ORDER BY d.date;
+
+    Q4 — Prediction history: predicted vs actual (Line chart):
+    SELECT predicted_at::date AS date,
+           predicted_close, actual_close, predicted_direction
+    FROM predictions
+    WHERE ticker = 'AAPL'
+    ORDER BY predicted_at;
+
+    Q5 — Weekly directional accuracy % (Bar chart):
+    SELECT DATE_TRUNC('week', predicted_at) AS week,
+           ROUND(100.0 * SUM(CASE
+               WHEN (predicted_direction = 'UP' AND actual_close > predicted_close)
+                 OR (predicted_direction = 'DOWN' AND actual_close < predicted_close)
+               THEN 1 ELSE 0 END) / COUNT(*), 1) AS accuracy_pct
+    FROM predictions
+    WHERE actual_close IS NOT NULL
+    GROUP BY week ORDER BY week;
+
+    Q6 — Live 1-min feed: last 60 minutes (Line chart, auto-refresh 1 min):
+    SELECT window_start, open, high, low, close, volume
+    FROM stock_prices_stream
+    WHERE ticker = 'AAPL'
+      AND window_start >= NOW() - INTERVAL '60 minutes'
+    ORDER BY window_start;
+
+    Q7 — Today's VWAP vs close vs SMA-10 (Line chart):
+    SELECT window_start, close, vwap,
+           AVG(close) OVER (
+               ORDER BY window_start
+               ROWS BETWEEN 9 PRECEDING AND CURRENT ROW
+           ) AS sma_10
+    FROM stock_prices_stream
+    WHERE ticker = 'AAPL'
+      AND window_start::date = CURRENT_DATE
+    ORDER BY window_start;
+
+    For each question: confirm chart type, X axis, Y axis series, and
+    whether to enable auto-refresh (Q6 and Q7 should auto-refresh every 60s).
+
+8.3 Combine all 7 into one Metabase Dashboard: "Stock Prediction Monitor"
+    Describe the recommended layout:
+    - Row 1: Q1 (price + SMA) full width
+    - Row 2: Q2 (volume) left half, Q3 (RSI) right half
+    - Row 3: Q6 (live feed) full width
+    - Row 4: Q7 (VWAP) left half, Q4 (predictions) right half
+    - Row 5: Q5 (weekly accuracy) full width
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GLOBAL CONSTRAINTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Never modify Kafka, Zookeeper, Schema Registry, or Bronze Parquet logic
+- Bronze Parquet sink must keep working even if Postgres is completely down
+- All credentials in .env — never hardcoded anywhere
+- All DB writes must be idempotent (upserts, never plain inserts)
+- PostgreSQL data persists across docker-compose down (named volumes)
+- psycopg2-binary + SQLAlchemy>=2.0 in requirements.txt
+- Default ticker: AAPL — parameterisable everywhere
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+NEW FILES CREATED BY THIS PROMPT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+config/init.sql                        ← DB schema (auto-runs on Postgres start)
+config/pgadmin_servers.json            ← pre-registers Stock Postgres in pgAdmin
+src/utils/__init__.py
+src/utils/db_writer.py                 ← shared SQLAlchemy + psycopg2 utility
+src/warehouse/gold_to_postgres.py      ← batch loader: Gold Parquet → PostgreSQL
+
+MODIFIED FILES:
+docker-compose.yml                     ← add postgres, pgadmin, metabase services
+.env.example                           ← add new credentials
+spark_streaming.py                     ← add Postgres foreachBatch sink
+src/app/api.py                         ← read history from DB, log predictions
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FINAL QUICK-START (full stack)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+docker-compose up -d
+python -m src.ingestion.yfinance_backfill
+spark-submit src/etl/spark_batch.py
+spark-submit src/warehouse/bronze_to_silver.py
+spark-submit src/warehouse/silver_to_gold.py
+python -m src.warehouse.gold_to_postgres        ← loads Gold → PostgreSQL
+python -m src.training.train_pipeline
+uvicorn src.app.api:app --port 8000 &
+streamlit run src/app/dashboard.py &
+spark-submit src/etl/spark_streaming.py         ← now writes to Postgres too
+
+Ports:
+  Kafka broker    :9092
+  PostgreSQL      :5432
+  pgAdmin         :5050   → http://localhost:5050
+  Metabase        :3000   → http://localhost:3000
+  FastAPI docs    :8000   → http://localhost:8000/docs
+  Streamlit       :8501   → http://localhost:8501
+
+Begin with Step 1. Show me the full updated docker-compose.yml before moving on.

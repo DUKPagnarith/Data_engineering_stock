@@ -1,0 +1,39 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 1 — Data Ingestion
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+python-dotenv>=1.0.0
+websocket-client>=1.7.0
+yfinance>=0.2.36
+pandas>=2.1.0
+pyarrow>=15.0.0
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 2 — ETL Pipeline (Kafka + PySpark)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+confluent-kafka>=2.3.0
+pyspark>=3.5.0
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 4 — Training & Visualization
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+scikit-learn>=1.4.0
+statsmodels>=0.14.0
+lightgbm>=4.3.0
+tensorflow>=2.15.0
+mlflow>=2.10.0
+matplotlib>=3.8.0
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Stage 5 — App / System
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+fastapi>=0.109.0
+uvicorn>=0.27.0
+requests>=2.31.0
+streamlit>=1.30.0
+plotly>=5.18.0
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Database (PostgreSQL)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.0
