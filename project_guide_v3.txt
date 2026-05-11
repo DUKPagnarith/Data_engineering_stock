@@ -1,0 +1,894 @@
+================================================================================
+  END-TO-END STOCK PREDICTION DATA PIPELINE — PROJECT GUIDE v3
+  Ticker: AAPL | Period: 2 years daily + real-time streaming
+================================================================================
+
+TABLE OF CONTENTS
+─────────────────
+  1.  Project Overview
+  2.  Architecture Summary
+  3.  Infrastructure & Tools
+  4.  Stage 1  — Data Source (Real-Time APIs)
+  5.  Stage 2  — ETL Pipeline (Streaming + Batch)
+  6.  Stage 3  — Data Warehouse (Medallion Architecture)
+  7.  Stage 4  — Model Training & Visualization
+  8.  Stage 5  — Application Layer
+  9.  Database Layer (PostgreSQL + pgAdmin)
+  10. Visualization Layer (Metabase)
+  11. Key Findings & Results
+  12. Design Decisions & Why
+  13. Known Limitations
+  14. File & Folder Structure
+  15. Quick Reference (Ports, Credentials, Commands)
+
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+This project builds a production-style data engineering and machine learning
+pipeline for stock price prediction. It follows the architecture taught in the
+Data Engineering course, covering every layer from real-time data ingestion to
+a live prediction API and business intelligence dashboard.
+
+Goal:
+  Predict the next-day closing price of AAPL stock using historical and
+  real-time market data, served through a REST API and visual dashboard.
+
+Core Question:
+  Can classical time series models (ARIMA) outperform modern ML (LightGBM, LSTM)
+  on a small financial dataset? Answer: Yes — see Section 11.
+
+Pipeline Philosophy:
+  Raw data is never modified. Every transformation produces a new, clean layer.
+  All data is traceable from the final Gold table back to the original API tick.
+
+
+================================================================================
+2. ARCHITECTURE SUMMARY
+================================================================================
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                  FULL SYSTEM ARCHITECTURE                            │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  [Finnhub WebSocket]──► kafka_producer.py ──► Kafka (stock-prices-raw)
+                                │                        │
+                                │ (invalid msgs)         ▼
+                                ▼               spark_streaming.py
+                         Kafka (DLQ)           (1-min OHLCV windows)
+                                                         │
+  [yfinance backfill] ──► data/raw/*.parquet             │
+                                │                        │
+                                ▼                        │
+                        spark_batch.py ─────────────────►│
+                                                         ▼
+                                              ┌─────────────────┐
+                                              │  BRONZE LAYER   │
+                                              │ (raw Parquet)   │
+                                              └────────┬────────┘
+                                                       │
+                                              bronze_to_silver.py
+                                                       │
+                                              ┌─────────────────┐
+                                              │  SILVER LAYER   │
+                                              │ (clean+features)│
+                                              └────────┬────────┘
+                                                       │
+                                              silver_to_gold.py
+                                                       │
+                                              ┌─────────────────┐
+                                              │   GOLD LAYER    │
+                                              │  (Star Schema)  │
+                                              └────────┬────────┘
+                                                       │
+                                    ┌──────────────────┴──────────────────┐
+                                    │                                     │
+                            train_pipeline.py                  gold_to_postgres.py
+                                    │                                     │
+                          ┌─────────────────┐                  ┌──────────────────┐
+                          │ ARIMA/LGBM/LSTM │                  │   PostgreSQL     │
+                          │ + MLflow        │                  │   stock_db       │
+                          └────────┬────────┘                  └────────┬─────────┘
+                                   │                                    │
+                          ┌────────▼────────┐              ┌────────────┴──────────┐
+                          │    FastAPI      │◄─────────────│  pgAdmin   Metabase   │
+                          │    :8000        │              │  :5051     :3000       │
+                          └────────┬────────┘              └───────────────────────┘
+                                   │
+                          ┌────────▼────────┐
+                          │   Streamlit     │
+                          │   :8501         │
+                          └─────────────────┘
+
+
+================================================================================
+3. INFRASTRUCTURE & TOOLS
+================================================================================
+
+  CATEGORY          TOOL                  VERSION     PURPOSE
+  ────────────────────────────────────────────────────────────────────────────
+  Language          Python                3.12        All scripting & ML
+  Runtime           Java (OpenJDK)        17          Required by PySpark
+  Containerisation  Docker + Compose      latest      All services
+  Message Queue     Apache Kafka          3.x         Real-time trade events
+  Coordination      Apache Zookeeper      3.x         Kafka broker management
+  Schema Mgmt       Schema Registry       latest      Future Avro support
+  Stream Processing PySpark               3.5.1       Streaming + batch ETL
+  Storage Format    Parquet               —           Bronze/Silver/Gold files
+  Database          PostgreSQL            15          Persistent data warehouse
+  DB Browser        pgAdmin 4             latest      SQL GUI for PostgreSQL
+  BI Dashboard      Metabase              latest      No-code visualizations
+  ML — Classical    statsmodels (ARIMA)   0.14.x      Baseline time series
+  ML — Gradient     LightGBM              4.x         Feature-based model
+  ML — Deep         Keras (LSTM)          3.x         Sequence model
+  Experiment Track  MLflow                2.x         Model + metric logging
+  API Framework     FastAPI               0.110.x     Prediction REST API
+  Dashboard         Streamlit             1.x         Interactive frontend
+  Data Ingestion    yfinance              0.2.x       Historical OHLCV
+  Data Ingestion    finnhub-python        2.x         Real-time websocket
+  Data Ingestion    websocket-client      1.x         WS connection management
+  ORM / DB Conn.    SQLAlchemy            2.x         DB connection pooling
+  DB Driver         psycopg2-binary       2.9.x       PostgreSQL Python driver
+  Env Management    python-dotenv         1.x         .env file loading
+
+  DOCKER SERVICES (after docker compose up -d):
+  ────────────────────────────────────────────────────────────────────────────
+  stock_zookeeper       internal          Kafka coordination
+  stock_kafka           localhost:9092    Message broker
+  stock_schema_registry localhost:8081    Schema management
+  stock_postgres        localhost:5433    PostgreSQL data warehouse
+  stock_pgadmin         localhost:5051    Database browser UI
+  stock_metabase        localhost:3000    BI dashboards
+
+
+================================================================================
+4. STAGE 1 — DATA SOURCE (REAL-TIME APIS)
+================================================================================
+
+PURPOSE:
+  Bring stock data from the outside world into the system via two parallel paths:
+  one for live tick-by-tick data, one for 2 years of historical daily bars.
+
+────────────────────────────────────────
+4A. REAL-TIME PATH — Finnhub WebSocket
+────────────────────────────────────────
+
+  File:    src/ingestion/finnhub_producer.py
+  Why:     Finnhub offers a free real-time websocket with no 15-minute delay,
+           unlike Polygon.io (free tier delayed) or Alpha Vantage (REST only).
+           Rate limit: 60 REST/min + unlimited websocket messages.
+
+  What it does:
+    - Connects to wss://ws.finnhub.io with FINNHUB_API_KEY from .env
+    - Subscribes to AAPL trade events
+    - Each message = one individual trade tick:
+        { ticker, price, volume, timestamp_ms, timestamp, conditions, source }
+    - Streams JSON to stdout (picked up by kafka_producer.py in Stage 2)
+    - Reconnects automatically on disconnect (exponential backoff)
+
+  NOTE: Trade ticks are NOT converted to OHLCV here.
+        Aggregation into 1-minute bars is deferred to Stage 2 (PySpark),
+        which is faster and more reliable for windowed aggregation.
+
+────────────────────────────────────────
+4B. BATCH PATH — yfinance Backfill
+────────────────────────────────────────
+
+  File:    src/ingestion/yfinance_backfill.py
+  Why:     The ML model needs 2 years of data to train. The live stream would
+           take 2 years to accumulate it. yfinance fetches it in seconds.
+
+  What it does:
+    - Fetches 2 years of adjusted daily OHLCV for AAPL from Yahoo Finance
+    - Adds metadata: ticker, source="yfinance", ingested_at
+    - Saves to data/raw/historical_AAPL.csv and historical_AAPL.parquet
+    - Output schema: ticker, date, open, high, low, close, volume, source, ingested_at
+
+  Command:
+    python -m src.ingestion.yfinance_backfill --ticker AAPL --years 2
+
+
+================================================================================
+5. STAGE 2 — ETL PIPELINE (STREAMING + BATCH)
+================================================================================
+
+PURPOSE:
+  Move raw data from Stage 1 reliably into the Bronze layer using two paths:
+  streaming (live ticks via Kafka) and batch (historical Parquet files).
+  Both paths use the same transformation logic to guarantee consistency.
+
+PATTERN: Lambda Architecture
+  Both paths share transforms.py — one set of rules, applied identically
+  to live and historical data, so they can never drift apart.
+
+────────────────────────────────────────
+5A. KAFKA SETUP
+────────────────────────────────────────
+
+  File:    docker-compose.yml (kafka + zookeeper services)
+  Why:     Kafka acts as a buffer between the Finnhub websocket and PySpark.
+           If PySpark crashes, messages stay in Kafka (7-day retention).
+           Nothing is lost. Processing resumes from where it stopped.
+
+  Topics:
+    stock-prices-raw   3 partitions   7-day retention   main trade events
+    stock-prices-dlq   1 partition    30-day retention  malformed messages
+
+  Dead-Letter Queue (DLQ):
+    If a Finnhub message is missing required fields (price, volume, timestamp),
+    it is routed to stock-prices-dlq instead of crashing the pipeline.
+
+  Files:
+    src/etl/kafka_producer.py    Finnhub → Kafka bridge (validates + publishes)
+    src/etl/kafka_consumer.py    Verification consumer for debugging
+
+────────────────────────────────────────
+5B. PYSPARK STRUCTURED STREAMING
+────────────────────────────────────────
+
+  File:    src/etl/spark_streaming.py
+  Why:     PySpark handles high-volume windowed aggregation efficiently.
+           Converting thousands of ticks into 1-minute OHLCV bars requires
+           stateful processing — plain Python loops would be too slow.
+
+  Pipeline:
+    Kafka (stock-prices-raw)
+      → Parse JSON → validate trades
+      → Add event_time from timestamp_ms
+      → Watermark: 5 minutes (accepts late data up to 5 min late)
+      → 1-minute tumbling window → aggregate: open(first), high(max),
+        low(min), close(last), volume(sum), vwap, trade_count
+      → Add Bronze metadata (ingested_at, source_api, batch_id)
+
+  DUAL SINK (writes to two destinations simultaneously):
+    Sink 1: Parquet → data/bronze/stock_prices/ (partitioned by date, ticker)
+    Sink 2: PostgreSQL → stock_prices_stream table (via foreachBatch)
+            If PostgreSQL is down → warning logged, Parquet sink continues.
+
+  Key settings:
+    Watermark:       5 minutes   (handles late-arriving market data)
+    Trigger:         1 minute    (micro-batch interval)
+    Output mode:     append      (bars are immutable once window closes)
+    Checkpointing:   data/checkpoints/streaming_bronze/ (crash recovery)
+
+────────────────────────────────────────
+5C. PYSPARK BATCH
+────────────────────────────────────────
+
+  File:    src/etl/spark_batch.py
+  Why:     Historical data from yfinance is daily OHLCV (pre-aggregated).
+           It needs the same Bronze schema and metadata as the streaming path
+           so downstream stages are source-agnostic.
+
+  Pipeline:
+    data/raw/historical_AAPL.parquet
+      → validate → align schema (rename date→window_start)
+      → add Bronze metadata (source_api="yfinance", batch_id)
+      → write Parquet → data/bronze/stock_prices/ (mode=append)
+
+────────────────────────────────────────
+5D. SHARED TRANSFORMS
+────────────────────────────────────────
+
+  File:    src/etl/transforms.py
+
+  Functions shared by both streaming and batch:
+    validate_trades()           Filter invalid raw trade ticks
+    validate_historical()       Filter invalid daily OHLCV rows
+    aggregate_ohlcv_1min()      1-minute tumbling window aggregation
+    add_bronze_metadata()       Append ingested_at, source_api, batch_id
+    add_date_partition_column() Add date column for Parquet partitioning
+
+
+================================================================================
+6. STAGE 3 — DATA WAREHOUSE (MEDALLION ARCHITECTURE)
+================================================================================
+
+PURPOSE:
+  Transform raw Bronze data into progressively cleaner, richer layers.
+  Each layer has a clear contract and a specific audience.
+
+PATTERN: Bronze → Silver → Gold (Medallion Architecture)
+
+  Layer    State                 Who uses it              Files written to
+  ──────────────────────────────────────────────────────────────────────────
+  Bronze   Raw, immutable        Data engineers           data/bronze/
+  Silver   Clean + enriched      Data scientists          data/silver/
+  Gold     Analytics-ready       ML models, dashboards    data/gold/
+
+────────────────────────────────────────
+6A. BRONZE LAYER
+────────────────────────────────────────
+
+  Written by: spark_batch.py + spark_streaming.py
+  Location:   data/bronze/stock_prices/date=.../ticker=.../
+
+  Rules:
+    - Append-only. Never modified after writing.
+    - Stores data exactly as received — no transformations.
+    - Extra metadata columns added: ingested_at, source_api, batch_id
+    - Partitioned by (date, ticker) for efficient querying
+
+  Why keep raw data?
+    If Silver/Gold processing has a bug, Bronze is the safety net.
+    Re-run bronze_to_silver.py and everything is rebuilt from scratch.
+
+  Rows: 501 (2 years AAPL daily bars)
+
+────────────────────────────────────────
+6B. SILVER LAYER
+────────────────────────────────────────
+
+  File:     src/warehouse/bronze_to_silver.py
+  Location: data/silver/stock_prices/ + data/silver/quality_report/
+
+  Cleaning operations:
+    Null handling:      Drop rows missing ticker, close, volume, window_start
+    Type enforcement:   Cast OHLCV to double, volume to long
+    Deduplication:      By (ticker, window_start) — keep most recent
+    Outlier detection:  Flag rows where |close - 20d_mean| > 3σ as is_outlier=True
+
+  Feature engineering (14 features added):
+    RETURNS:    daily_return_pct
+    TREND:      sma_7, sma_30, ema_12, ema_26
+    MOMENTUM:   macd, macd_signal, macd_histogram, rsi_14
+    VOLATILITY: bb_upper, bb_middle, bb_lower, volatility_7d
+    VOLUME:     volume_zscore
+
+  Data quality checks (all 6 passed on 501 rows):
+    [CRITICAL] no_null_close        0/501 violations
+    [CRITICAL] no_null_ticker       0/501 violations
+    [CRITICAL] close_positive       0/501 violations
+    [WARNING]  high_gte_low         0/501 violations
+    [WARNING]  volume_non_negative  0/501 violations
+    [WARNING]  rsi_in_range         0/501 violations
+    [WARNING]  outlier_pct_below_5  18/501 flagged (within acceptable range)
+    Overall: ALL CHECKS PASSED ✓
+
+────────────────────────────────────────
+6C. GOLD LAYER — STAR SCHEMA
+────────────────────────────────────────
+
+  File:     src/warehouse/silver_to_gold.py
+  Location: data/gold/
+
+  Why Star Schema over 3NF (Normalised)?
+    Fewer JOINs → faster queries for analytics and ML.
+    Analysts and models query fact + one dimension, not a web of tables.
+
+  Tables:
+
+    FACT TABLE:
+      fact_stock_prices (501 rows)
+        ticker_id, date_id (foreign keys)
+        open, high, low, close, volume, vwap
+        daily_return_pct, sma_7, sma_30, ema_12, ema_26
+        macd, macd_signal, macd_histogram, rsi_14
+        bb_upper, bb_middle, bb_lower
+        volatility_7d, volume_zscore, is_outlier
+        target_next_close  ← ML prediction target
+
+    DIMENSION TABLES:
+      dim_ticker (1 row)
+        ticker_id, symbol, company_name, sector, exchange
+
+      dim_date (730 rows — continuous date range)
+        date_id, date, day_of_week, day_name, week,
+        month, month_name, quarter, year, is_trading_day
+
+      dim_market_session (3 rows)
+        session_id, session_type (pre/regular/after),
+        open_time, close_time, description
+
+  Also in PostgreSQL (written by streaming):
+      stock_prices_stream
+        1-minute OHLCV bars from the live Kafka stream
+        ticker, window_start, window_end, open, high, low, close,
+        volume, vwap, trade_count, ingested_at, source_api
+
+      predictions
+        Logged by FastAPI on every /predict call
+        ticker, predicted_at, predicted_close, predicted_direction,
+        model_used, actual_close (filled in later for accuracy tracking)
+
+
+================================================================================
+7. STAGE 4 — MODEL TRAINING & VISUALIZATION
+================================================================================
+
+PURPOSE:
+  Train three models of increasing complexity on Gold data, evaluate them
+  honestly on a held-out test set, and track all experiments with MLflow.
+
+────────────────────────────────────────
+7A. DATA PREPARATION
+────────────────────────────────────────
+
+  File:   src/training/data_prep.py
+  Source: Gold layer fact_stock_prices (Parquet)
+
+  Split strategy (strictly time-based — NO shuffling):
+    Train:      Earliest 70% → 329 rows
+    Validation: Next 15%     → 70 rows
+    Test:       Final 15%    → 71 rows (never seen during training)
+
+  Why no shuffling?
+    Shuffling lets the model train on May 2025 data and test on Jan 2024.
+    That is data leakage — the future cannot help predict the past.
+
+  Scaling: StandardScaler fit on training data only.
+    Fitting on all data would leak validation/test statistics into training.
+
+  LSTM sequences: 30-day sliding window → shape (samples, 30, 19 features)
+
+────────────────────────────────────────
+7B. MODELS
+────────────────────────────────────────
+
+  Model 1 — ARIMA (Baseline)
+    Library:  statsmodels
+    Config:   p=5 (AR order), d=1 (differencing), q=2 (MA order)
+    Why:      Captures linear autocorrelation. d=1 removes the price trend.
+              Univariate — uses only past close prices, no engineered features.
+
+  Model 2 — LightGBM (Intermediate)
+    Library:  lightgbm
+    Config:   n_estimators=500, learning_rate=0.05, max_depth=6,
+              num_leaves=31, early_stopping=50 rounds
+    Why:      Gradient boosted trees capture non-linear feature interactions.
+              Uses all 19 engineered features. Fast training, handles missing values.
+
+  Model 3 — LSTM (Advanced)
+    Library:  Keras (TensorFlow backend)
+    Config:   LSTM(64) → Dropout(0.2) → LSTM(32) → Dropout(0.2) → Dense(16) → Dense(1)
+    Input:    (30 days, 19 features)
+    Why:      Learns complex sequential patterns over a 30-day lookback.
+              Best suited for large datasets (needs thousands of rows to generalise).
+
+────────────────────────────────────────
+7C. EVALUATION METRICS
+────────────────────────────────────────
+
+  MAE     Mean Absolute Error — average prediction error in dollars
+  RMSE    Root Mean Squared Error — penalises large errors more heavily
+  MAPE    Mean Absolute Percentage Error — scale-independent accuracy %
+  Dir.Acc Directional Accuracy — % of up/down moves correctly predicted
+  Sharpe  Risk-adjusted return of a long/short strategy using predictions
+          (Sharpe > 1.0 = potentially profitable; > 2.0 = strong signal)
+
+────────────────────────────────────────
+7D. VISUALIZATIONS (6 plots saved to data/plots/)
+────────────────────────────────────────
+
+  01_actual_vs_predicted.png    All 3 models overlaid on test set prices
+  02_feature_importance.png     LightGBM top-15 feature ranking
+  03_lstm_loss_curve.png        Training vs validation loss over epochs
+  04_residual_distribution.png  Error distribution histograms (all models)
+  05_candlestick_predictions.png Test period candlestick + model predictions
+  06_comparison_table.png       Styled metrics table (all models × all metrics)
+
+────────────────────────────────────────
+7E. MLFLOW EXPERIMENT TRACKING
+────────────────────────────────────────
+
+  Location: data/mlruns/
+  UI:       mlflow ui --backend-store-uri file://$(pwd)/data/mlruns
+            → http://127.0.0.1:5000
+
+  Logged per run: hyperparameters, MAE, RMSE, MAPE, Dir.Acc,
+                  Sharpe ratio, model artifacts
+
+
+================================================================================
+8. STAGE 5 — APPLICATION LAYER
+================================================================================
+
+────────────────────────────────────────
+8A. FASTAPI — REST API
+────────────────────────────────────────
+
+  File:    src/app/api.py
+  Port:    8000
+  Docs:    http://localhost:8000/docs (Swagger UI, auto-generated)
+
+  Why FastAPI?
+    Wraps the trained model in a web server so any client (Streamlit, browser,
+    mobile app) can get predictions via HTTP — no Python or model files needed.
+    The model loads once at startup (<1 second for ARIMA), so predictions
+    are returned instantly.
+
+  Endpoints:
+    GET  /health              Model loaded status + data row count
+    GET  /predict?ticker=AAPL Next-day close prediction + direction + % change
+    GET  /history?ticker=AAPL&days=30  Recent OHLCV from PostgreSQL
+    POST /retrain             Triggers background model retraining (async)
+    GET  /                    Redirects to /docs
+
+  Key design decisions:
+    - Pydantic models validate all inputs and outputs (typed, safe)
+    - /retrain uses BackgroundTasks — API stays responsive during retraining
+    - /predict logs each call to the predictions table in PostgreSQL
+    - /history reads from PostgreSQL (not Parquet) for live consistency
+    - SQLAlchemy connection pool (pool_size=5) created once at startup
+
+  Verified test results:
+    GET /health   → {"status":"healthy","model_loaded":true,"data_rows":501}
+    GET /predict  → {"predicted_next_close":292.81,"direction":"DOWN","model":"ARIMA"}
+    GET /history  → {"days_returned":3,"data":[...]}
+    POST /retrain → {"status":"started","message":"Retraining started..."}
+
+────────────────────────────────────────
+8B. STREAMLIT — INTERACTIVE DASHBOARD
+────────────────────────────────────────
+
+  File:    src/app/dashboard.py
+  Port:    8501
+  URL:     http://localhost:8501
+
+  Features:
+    Live prediction panel    Polls FastAPI /predict every 30 seconds
+    Candlestick chart        Plotly interactive chart + SMA overlays + prediction star
+    Volume bars              Color-coded (green=up day, red=down day)
+    Model metrics panel      Comparison table with best model highlighted
+    Plot gallery             Dropdown to view all 6 training visualizations
+    Ticker selector          Switch between AAPL, MSFT, GOOGL, AMZN, TSLA, META, NVDA
+    Graceful fallback        If API offline → loads from Gold Parquet directly
+    Dark theme               Custom CSS with glassmorphism metric cards
+
+  Architecture note:
+    Streamlit is a "customer" — it orders predictions from FastAPI (the "waiter"),
+    which gets them from the model (the "kitchen"). Streamlit never loads the
+    model directly.
+
+
+================================================================================
+9. DATABASE LAYER (POSTGRESQL + PGADMIN)
+================================================================================
+
+────────────────────────────────────────
+9A. POSTGRESQL
+────────────────────────────────────────
+
+  Container:  stock_postgres
+  Image:      postgres:15
+  Host port:  5433 (use 5432 inside Docker network)
+  Database:   stock_db (our data) + metabase (Metabase internals)
+
+  Schema initialised by: config/init.sql (runs automatically on first start)
+
+  Tables in stock_db:
+    dim_ticker            1 row    Ticker metadata (symbol, sector, exchange)
+    dim_date              730 rows Continuous date calendar with trading flags
+    dim_market_session    3 rows   Pre/regular/after-hours session info
+    fact_stock_prices     501 rows Star Schema fact (OHLCV + 14 features + target)
+    stock_prices_stream   growing  Live 1-minute bars from PySpark streaming
+    predictions           growing  Every /predict API call logged here
+
+  Shared utility:  src/utils/db_writer.py
+    get_engine()                  SQLAlchemy engine (pool_size=5, max_overflow=10)
+    write_df_to_postgres()        Bulk upsert via psycopg2 execute_values
+                                  Retries 3× with exponential backoff
+                                  Idempotent — safe to run multiple times
+
+  Batch loader:    src/warehouse/gold_to_postgres.py
+    Reads Gold Parquet → inserts into PostgreSQL Star Schema
+    Load order respects foreign keys: dim_ticker → dim_date →
+    dim_market_session → fact_stock_prices
+
+────────────────────────────────────────
+9B. PGADMIN
+────────────────────────────────────────
+
+  Container:  stock_pgadmin
+  URL:        http://localhost:5051
+  Email:      admin@stock.com
+  Password:   admin123
+
+  Stock Postgres connection (inside pgAdmin):
+    Host:      stock_postgres
+    Port:      5432
+    Username:  stock_user
+    Password:  stock_password
+    Database:  stock_db
+
+  Pre-registered via config/pgadmin_servers.json — server appears in sidebar
+  automatically on first login, no manual setup required.
+
+  Use pgAdmin for:
+    - Browsing all tables and row counts
+    - Running ad-hoc SQL queries (Query Tool)
+    - Monitoring live rows arriving in stock_prices_stream during streaming
+    - Verifying data quality after each pipeline run
+
+  Live stream monitor query (run while spark_streaming.py is active):
+    SELECT ticker, window_start, close, volume
+    FROM stock_prices_stream
+    ORDER BY window_start DESC LIMIT 10;
+
+
+================================================================================
+10. VISUALIZATION LAYER (METABASE)
+================================================================================
+
+  Container:  stock_metabase
+  URL:        http://localhost:3000
+  Setup:      Create admin account on first visit
+
+  Connect to database:
+    Type:      PostgreSQL
+    Host:      stock_postgres
+    Port:      5432
+    Database:  stock_db
+    Username:  stock_user
+    Password:  stock_password
+
+  Tables available for visualization:
+    fact_stock_prices     Historical daily bars + all 14 technical indicators
+    dim_date              Date breakdowns (week, month, quarter, year)
+    dim_ticker            Company metadata (sector, exchange)
+    stock_prices_stream   Live 1-minute bars from Kafka streaming
+    predictions           Model prediction history + actual prices
+
+  Metabase stores its own internal data in a separate database ("metabase")
+  on the same PostgreSQL instance — keeps it clean from our stock data.
+
+  Difference from Streamlit:
+    Streamlit → developer-built dashboard, polls FastAPI, Python-controlled
+    Metabase  → no-code BI tool, queries PostgreSQL directly, drag-and-drop charts
+
+
+================================================================================
+11. KEY FINDINGS & RESULTS
+================================================================================
+
+────────────────────────────────────────
+MODEL COMPARISON (test set, 71 rows)
+────────────────────────────────────────
+
+  Model      MAE ($)  RMSE ($)  MAPE (%)  Dir.Acc (%)  Sharpe
+  ─────────────────────────────────────────────────────────────
+  ARIMA ✅    4.71     6.01      1.78      53.5         +2.52
+  LightGBM   16.94    19.28     6.29      46.5         -1.90
+  LSTM       43.57    45.22     16.39     43.9         -3.12
+
+WINNER: ARIMA
+
+────────────────────────────────────────
+WHY ARIMA WON
+────────────────────────────────────────
+
+  1. Dataset size (471 training rows) is too small for LightGBM and LSTM
+     to generalise well. Both models overfit.
+
+  2. ARIMA directly models the autocorrelation structure of daily close prices
+     — stock prices have strong short-term memory (today predicts tomorrow
+     better than any feature engineering does on small samples).
+
+  3. ARIMA's Sharpe Ratio of +2.52 means a simple long/short strategy using
+     its directional predictions would be profitable on the test period.
+     LightGBM (-1.90) and LSTM (-3.12) would have lost money.
+
+  4. Differencing (d=1) removes the price trend, making the series stationary,
+     which is the core condition ARIMA requires.
+
+────────────────────────────────────────
+DATA QUALITY
+────────────────────────────────────────
+
+  Bronze rows ingested:       501
+  Silver after cleaning:      501  (0 rows dropped — data was clean)
+  Outliers flagged (3σ):       18  (3.6% — within acceptable range)
+  Gold fact rows:             501
+  Quality checks passed:     6/6
+
+────────────────────────────────────────
+PIPELINE RESULTS
+────────────────────────────────────────
+
+  dim_date rows:              730  (continuous calendar, 2 years)
+  Features engineered:         14  (trend, momentum, volatility, volume)
+  Models trained:               3  (ARIMA, LightGBM, LSTM)
+  MLflow runs logged:           3
+  Plots generated:              6
+  API endpoints verified:       4  (/health, /predict, /history, /retrain)
+
+
+================================================================================
+12. DESIGN DECISIONS & WHY
+================================================================================
+
+  DECISION                        REASON
+  ────────────────────────────────────────────────────────────────────────────
+  Kafka as message buffer         Decouples Finnhub ingestion from processing.
+                                  Messages survive PySpark crashes (7-day retention).
+
+  Lambda Architecture             Batch and streaming use identical transforms.py.
+                                  Prevents logic drift between paths.
+
+  Bronze immutability             Any Gold/Silver bug can be fixed by reprocessing
+                                  from Bronze. Raw data is never lost.
+
+  Star Schema for Gold            Fewer JOINs than 3NF. ML models and BI dashboards
+                                  read faster. Pre-computed features in fact table.
+
+  Time-based train/test split     Prevents data leakage. Future data cannot train
+                                  a model to predict the past.
+
+  StandardScaler fit on train     Prevents test statistics leaking into training.
+  only
+
+  foreachBatch for Postgres       Lighter than JDBC. Allows custom upsert logic.
+  write                           Postgres failure never kills the Parquet sink.
+
+  ARIMA as production model       Best empirical performance on this dataset size.
+                                  LightGBM/LSTM need more data to outperform.
+
+  FastAPI not reading Parquet     PostgreSQL is faster for live API queries.
+  directly                        Single source of truth for API + Metabase.
+
+  Separate metabase DB            Keeps Metabase internals out of stock_db tables.
+                                  Prevents confusion when browsing in pgAdmin.
+
+  Upserts everywhere              All DB writes are idempotent — safe to re-run
+                                  any pipeline step without creating duplicates.
+
+
+================================================================================
+13. KNOWN LIMITATIONS
+================================================================================
+
+  1. DATASET SIZE
+     471 training rows is small. LightGBM and LSTM need thousands of samples.
+     ARIMA wins here, but may lose as data grows over time.
+
+  2. MARKET HOURS DEPENDENCY
+     The Finnhub websocket only receives live trades Mon–Fri 9:30am–4:00pm EST.
+     Outside these hours, the streaming job runs but receives no data.
+
+  3. ARIMA IS UNIVARIATE
+     ARIMA only uses past close prices. It ignores the 14 engineered features
+     (RSI, MACD, Bollinger Bands) that LightGBM uses. A future improvement
+     would be ARIMAX (ARIMA with exogenous features).
+
+  4. NO LIVE RETRAINING SCHEDULE
+     The model is retrained manually. In production, it should retrain nightly
+     on new data using a scheduler like Airflow.
+
+  5. SINGLE TICKER
+     The pipeline defaults to AAPL. Multi-ticker support requires partitioning
+     the training pipeline by symbol and building separate models.
+
+  6. PREDICTIONS TABLE ACCURACY
+     actual_close in the predictions table is NULL until filled in manually.
+     An automated job should backfill it with the next day's close price.
+
+  7. NO AUTHENTICATION
+     FastAPI and Streamlit have no auth. In production, add OAuth2 or API keys.
+
+
+================================================================================
+14. FILE & FOLDER STRUCTURE
+================================================================================
+
+  data_engineer_prject_final_course/
+  ├── .env                          API keys + DB credentials (never commit)
+  ├── .env.example                  Template for environment variables
+  ├── .gitignore
+  ├── requirements.txt              All Python dependencies
+  ├── docker-compose.yml            Kafka + Postgres + pgAdmin + Metabase
+  │
+  ├── config/
+  │   ├── settings.py               Centralised config loader (reads .env)
+  │   ├── init.sql                  PostgreSQL schema (auto-runs on first start)
+  │   └── pgadmin_servers.json      Pre-registers stock_postgres in pgAdmin
+  │
+  ├── src/
+  │   ├── ingestion/                STAGE 1
+  │   │   ├── finnhub_producer.py   Real-time websocket → JSON stream
+  │   │   └── yfinance_backfill.py  2 years historical OHLCV → Parquet
+  │   │
+  │   ├── etl/                      STAGE 2
+  │   │   ├── kafka_producer.py     Finnhub → Kafka (validates + DLQ routing)
+  │   │   ├── kafka_consumer.py     Debug consumer (verify messages)
+  │   │   ├── transforms.py         Shared validation + aggregation (both paths)
+  │   │   ├── spark_streaming.py    Kafka → 1-min OHLCV → Bronze + Postgres
+  │   │   └── spark_batch.py        Parquet → Bronze (historical path)
+  │   │
+  │   ├── warehouse/                STAGE 3
+  │   │   ├── bronze_to_silver.py   Clean + 14 features + quality checks
+  │   │   ├── silver_to_gold.py     Star Schema builder (fact + 3 dims)
+  │   │   └── gold_to_postgres.py   Batch loader: Gold Parquet → PostgreSQL
+  │   │
+  │   ├── training/                 STAGE 4
+  │   │   ├── data_prep.py          Load + split + scale (no leakage)
+  │   │   ├── models.py             ARIMA, LightGBM, LSTM implementations
+  │   │   ├── evaluate.py           MAE, RMSE, MAPE, Dir.Acc, Sharpe
+  │   │   ├── visualize.py          6 plot generators
+  │   │   └── train_pipeline.py     Main orchestrator (runs all 3 models)
+  │   │
+  │   ├── app/                      STAGE 5
+  │   │   ├── api.py                FastAPI (4 endpoints + prediction logging)
+  │   │   └── dashboard.py          Streamlit (candlestick + live prediction)
+  │   │
+  │   └── utils/
+  │       └── db_writer.py          Shared SQLAlchemy + psycopg2 bulk writer
+  │
+  └── data/
+      ├── raw/                      Stage 1 output (CSV + Parquet)
+      ├── bronze/stock_prices/      Stage 2 output (partitioned Parquet)
+      ├── silver/
+      │   ├── stock_prices/         Stage 3 Silver (enriched Parquet)
+      │   └── quality_report/       Data quality JSON report
+      ├── gold/                     Stage 3 Gold (Star Schema Parquet)
+      │   ├── fact_stock_prices/
+      │   ├── dim_ticker/
+      │   ├── dim_date/
+      │   └── dim_market_session/
+      ├── models/
+      │   └── comparison_table.csv  All models × all metrics
+      ├── plots/                    6 PNG visualizations
+      ├── mlruns/                   MLflow experiment tracking
+      └── checkpoints/              PySpark streaming fault tolerance
+
+
+================================================================================
+15. QUICK REFERENCE
+================================================================================
+
+PORTS & URLS
+────────────────────────────────────────────────────────────────────────────────
+  FastAPI (docs)    http://localhost:8000/docs
+  Streamlit         http://localhost:8501
+  pgAdmin           http://localhost:5051
+  Metabase          http://localhost:3000
+  MLflow            http://127.0.0.1:5000  (when running)
+  Kafka broker      localhost:9092
+  PostgreSQL        localhost:5433 (from Mac) / 5432 (inside Docker)
+
+
+CREDENTIALS
+────────────────────────────────────────────────────────────────────────────────
+  pgAdmin login:    admin@stock.com / admin123
+  PostgreSQL:       stock_user / stock_password / stock_db
+  Metabase:         your account (created on first visit)
+
+
+ENVIRONMENT VARIABLES (set in every new terminal)
+────────────────────────────────────────────────────────────────────────────────
+  export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
+  export SPARK_HOME=/opt/anaconda3/lib/python3.12/site-packages/pyspark
+
+
+SPARK-SUBMIT COMMAND (always use $SPARK_HOME/bin/spark-submit)
+────────────────────────────────────────────────────────────────────────────────
+  $SPARK_HOME/bin/spark-submit src/etl/spark_batch.py
+  $SPARK_HOME/bin/spark-submit src/warehouse/bronze_to_silver.py
+  $SPARK_HOME/bin/spark-submit src/warehouse/silver_to_gold.py
+  $SPARK_HOME/bin/spark-submit \
+    --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+    src/etl/spark_streaming.py
+
+
+DOCKER COMMANDS
+────────────────────────────────────────────────────────────────────────────────
+  docker compose up -d                    Start all services
+  docker compose ps                       Check service status
+  docker compose logs <service>           Debug a specific service
+  docker compose down                     Stop services (data preserved)
+  docker compose down -v                  Stop + wipe all volumes (full reset)
+
+
+VERIFY POSTGRESQL (quick health check)
+────────────────────────────────────────────────────────────────────────────────
+  docker exec stock_postgres psql -U stock_user -d stock_db -c "
+    SELECT 'fact' AS tbl, COUNT(*) FROM fact_stock_prices
+    UNION ALL SELECT 'stream', COUNT(*) FROM stock_prices_stream
+    UNION ALL SELECT 'predictions', COUNT(*) FROM predictions;"
+
+
+================================================================================
+  END OF DOCUMENT
+  Project: Stock Prediction Data Pipeline | Student: Duk Pagnarith
+  Course: Data Engineering Final Project
+================================================================================
