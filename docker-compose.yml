@@ -20,6 +20,42 @@
 
 version: "3.8"
 
+# ── Shared Airflow config (anchor reused by all 3 Airflow services) ─────────
+x-airflow-common: &airflow-common
+  build:
+    context: .                          # project root, so Dockerfile can COPY requirements.txt
+    dockerfile: docker/airflow/Dockerfile
+  image: stock-airflow:latest
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    # Airflow's OWN metadata DB lives in the `airflow` database on the shared
+    # Postgres. Uses the literal container name (Airflow doesn't go through
+    # config/settings.py, so no host-swap concern here).
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-stock_user}:${POSTGRES_PASSWORD:-stock_password}@stock_postgres:5432/airflow
+    # Fixed keys so restarts don't invalidate sessions / encrypted values.
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-Zp8kP3qLrV6sN1tW9xY2bC4dE7fG0hJ5kM8nQ1rS3u=}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-stock-airflow-demo-secret}
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Passed through to DAG tasks (see dags/daily_training_dag.py TASK_ENV).
+    DEFAULT_TICKER: ${DEFAULT_TICKER:-AAPL}
+    POSTGRES_HOST: stockdb
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: ${POSTGRES_DB:-stock_db}
+    POSTGRES_USER: ${POSTGRES_USER:-stock_user}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stock_password}
+    _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+    _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+  volumes:
+    - .:/opt/project                    # project source — DAG tasks `cd` here;
+                                        # artifacts (data/, mlruns) written back to host
+    - ./dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+  user: "0:0"                           # root: reliable bind-mount writes for the demo
+  networks:
+    - stock-net
+
 services:
   # ────────────────────────────────────────────────────────────────────────
   #  KAFKA INFRASTRUCTURE (unchanged)
@@ -137,7 +173,12 @@ services:
       start_period: 30s
     restart: unless-stopped
     networks:
-      - stock-net
+      stock-net:
+        # `stockdb` alias: Airflow tasks set POSTGRES_HOST=stockdb so the
+        # host→localhost swap in config/settings.get_postgres_url() is bypassed
+        # while still resolving to this container on the Docker network.
+        aliases:
+          - stockdb
 
   # ── pgAdmin ────────────────────────────────────────────────────────────
   stock_pgadmin:
@@ -180,6 +221,48 @@ services:
     networks:
       - stock-net
 
+  # ────────────────────────────────────────────────────────────────────────
+  #  AIRFLOW — daily batch training orchestration
+  # ────────────────────────────────────────────────────────────────────────
+
+  # ── Airflow init (one-shot: create DB, migrate schema, make admin user) ──
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: ["bash", "/opt/project/docker/airflow/init.sh"]
+    depends_on:
+      stock_postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Airflow Webserver (UI) ──────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8088:8080"     # UI at http://localhost:8088  (8080 left free for Spark UI)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ── Airflow Scheduler (runs the DAGs) ───────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
 # ── Named volumes ──────────────────────────────────────────────────────────
 volumes:
   zookeeper-data:
@@ -187,6 +270,7 @@ volumes:
   kafka-data:
   postgres_data:       # PostgreSQL data persists across docker-compose down
   pgadmin_data:        # pgAdmin saved state persists across restarts
+  airflow-logs:        # Airflow task/scheduler logs
 
 # ── Shared network ─────────────────────────────────────────────────────────
 networks:
