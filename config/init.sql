@@ -21,6 +21,15 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'metabase')\gexec
 
 
 -- ────────────────────────────────────────────────────────────────────────────
+-- A2) Create Airflow's metadata database (separate from stock data)
+--     Also created defensively by docker/airflow/init.sh, since this file only
+--     runs on a FIRST Postgres start (not on an existing postgres_data volume).
+-- ────────────────────────────────────────────────────────────────────────────
+SELECT 'CREATE DATABASE airflow'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'airflow')\gexec
+
+
+-- ────────────────────────────────────────────────────────────────────────────
 -- B) Star Schema — Dimension Tables
 -- ────────────────────────────────────────────────────────────────────────────
 
